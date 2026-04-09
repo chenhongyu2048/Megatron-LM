@@ -129,7 +129,8 @@ def model_provider_llava_vlm(
     # Create MIMO model
     cp_group = pg_collection.cp if pg_collection is not None else None
     tp_group = pg_collection.tp if pg_collection is not None else None
-    mimo_model = MimoModel(mimo_model_config, cp_group=cp_group, tp_group=tp_group)
+    # mimo_model = MimoModel(mimo_model_config, cp_group=cp_group, tp_group=tp_group)
+    mimo_model = MimoModel(mimo_model_config)
     print("*"*100)
     print_mimo_structure(mimo_model)
     print("*"*100)
@@ -140,16 +141,16 @@ def model_provider_llava_vlm(
 
         _args = get_args()
         if  _args.language_model_checkpoint is not None:
-            load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
+            load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint) # type: ignore
             print(f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}")
     except (ModuleNotFoundError, AssertionError):
         pass
 
     # TODO: ykarnati make these configurable and have an API to freeze/unfreeze   
     # freeze vision encoder and LLM parameters
-    modules_to_freeze = [mimo_model.modality_submodules.images.encoders.clip_encoder, mimo_model.language_model]
-    for module in modules_to_freeze:
-        for param in module.parameters():
-            param.requires_grad = False
+    # modules_to_freeze = [mimo_model.modality_submodules.images.encoders.clip_encoder, mimo_model.language_model]
+    # for module in modules_to_freeze:
+    #     for param in module.parameters():
+    #         param.requires_grad = False
 
     return mimo_model

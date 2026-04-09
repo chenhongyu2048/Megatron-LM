@@ -154,11 +154,17 @@ class VLMTaskEncoder(
         bot_msgs = _ensure_list_type(bot_msgs)
 
         conversation = []
-        for _, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
+        for turn_idx, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
+            content = []
+            if turn_idx == 0:
+                # Tell the processor where to insert image tokens
+                content.append({"type": "image"})
+            content.append({"type": "text", "text": u_txt})
+
             conversation.append(
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": u_txt}],
+                    "content": content,
                 }
             )
             conversation.append(
@@ -396,7 +402,7 @@ class VLMTaskEncoder(
             if isinstance(values[0], torch.Tensor):
                batched[key] = torch.stack(values, dim=0)
             else:
-               batched[key] = values
+               batched[key] = values # type: ignore
         
         # Add context parallel padding if enabled
         if self._cp_size > 1:
@@ -527,7 +533,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Calculate max_seq_length as sum of text and image sequence lengths
-    max_seq_length = args.max_text_length + args.image_seq_length
+    max_seq_length = args.total_seq_length + args.image_seq_length
     
     model_name = "llava-hf/llava-1.5-7b-hf"
 
@@ -613,7 +619,7 @@ class PaddingProcessor:
                     values, batch_first=self.batch_first, padding_value=self.pad_value
                     )
         else:
-            return self._pad_and_stack(values, max_len, self.pad_value)
+            return self._pad_and_stack(values, max_len, self.pad_value) # type: ignore
 
 class PackingKwargsProcessor:
     """Extract the value at first index for packing_kwargs"""

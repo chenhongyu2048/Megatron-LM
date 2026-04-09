@@ -9,6 +9,7 @@ export PYTHONPATH="$HOME/run/Megatron-LM:$PYTHONPATH"
 export HF_TOKEN="$YOUR_HF_TOKEN"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
+export HF_HUB_OFFLINE=1
 DRY_RUN=false
 GPUS_PER_NODE=2
 NUM_NODES=1
@@ -31,7 +32,7 @@ WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs
 
 # for storing checkpoints
-ROOT_DIR='./local/'
+ROOT_DIR='/data/home/scyb683/run/Megatron-LM/mllm/ckpt/'
 CHECKPOINT_STORE_PATH=$ROOT_DIR'mimo_llava_train_hf_clip_'$EXP_NAME
 mkdir -p $CHECKPOINT_STORE_PATH
 
@@ -50,12 +51,13 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 2
+    --expert-model-parallel-size 2
 )
 
 TRAINING_ARGS=(
     --micro-batch-size $mbs
     --global-batch-size $gbs 
-    --train-iters 10 # Set to a small number for testing; adjust as needed for real training
+    --train-iters 50 # Set to a small number for testing; adjust as needed for real training
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --lr 1e-2
@@ -95,20 +97,46 @@ TOKENIZER_ARGS=(
 # Dataset args
 DATASET_ARGS=(
     --dataloader-type external
-    --dataset-provider mock # llava_vlm
+    --dataset-provider llava_vlm
     --data-path $DATASET_PATH
     #--packing-buffer-size 24
     --total-seq-length 2048
 )
 
-# GPT Model args
 GPT_MODEL_ARGS=(
-    --num-layers 2 # 32
+    --use-mcore-models
+    --disable-bias-linear
+    --seq-length 4096
+    # --encoder-seq-length 4096 # set seq-length or encoder-seq-length, not both
+    --max-position-embeddings 4096 # instead of 32768
+    --num-layers 2 # Set to a small number for testing; adjust as needed for real training
     --hidden-size 4096
+    --moe-ffn-hidden-size 14336 # if unassigned, fall back to ffn_hidden_size
+    --ffn-hidden-size 14336 # keep the same with moe_ffn-hidden-size
     --num-attention-heads 32
-    --max-position-embeddings 4096  
-    --encoder-seq-length 4096
+    --init-method-std 0.01
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --normalization RMSNorm
     --position-embedding-type rope
+    --swiglu
+    --untie-embeddings-and-output-weights
+    --group-query-attention
+    --num-query-groups 8
+    --no-masked-softmax-fusion
+    --no-position-embedding
+    --rotary-base 1000000
+)
+
+MOE_ARGS=(
+    --num-experts 4
+    --moe-router-topk 2
+    --moe-router-load-balancing-type aux_loss
+    --moe-aux-loss-coeff 1e-2
+    --moe-grouped-gemm
+    --moe-token-dispatcher-type alltoall
+    # --overlap-param-gather # --overlap-param-gather only supported with distributed optimizer or megatron fsdp
+    --overlap-grad-reduce # Disabled to avoid DDP bucket AssertionError caused by unused experts or unused vision branch
 )
 
 # Run the training script based on configuration
@@ -121,7 +149,8 @@ if [ "$DEBUG_MODE" = true ]; then
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${DATASET_ARGS[@]}
+    ${DATASET_ARGS[@]} \
+    ${MOE_ARGS[@]}
 else
   echo "Running in normal mode with $GPUS_PER_NODE GPU(s) per node..."
   if [ "$DRY_RUN" = true ]; then
@@ -132,7 +161,8 @@ else
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${DATASET_ARGS[@]}"
+    ${DATASET_ARGS[@]} \
+    ${MOE_ARGS[@]}"
   else
     python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} train.py \
     ${TRAINING_ARGS[@]} \
@@ -140,7 +170,8 @@ else
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${DATASET_ARGS[@]}
+    ${DATASET_ARGS[@]} \
+    ${MOE_ARGS[@]}
   fi
 fi
 

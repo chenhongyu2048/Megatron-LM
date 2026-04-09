@@ -19,6 +19,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training import get_args
 
 
 def get_vicuna_language_model_config(  
@@ -30,47 +31,78 @@ def get_vicuna_language_model_config(
     Llama-7B).
     """
 
-    cfg = TransformerConfig(num_layers=2, hidden_size=4096, num_attention_heads=32)
+    runtime_args = get_args()
+    
+    hidden_size = getattr(runtime_args, "hidden_size", 4096)
+    num_attention_heads = getattr(runtime_args, "num_attention_heads", 32)
+    
+    cfg = TransformerConfig(
+        num_layers=runtime_args.num_layers, 
+        hidden_size=hidden_size, 
+        num_attention_heads=num_attention_heads
+    )
 
-    # Feed-forward / MLP hidden size (11008 in original Vicuna).
-    cfg.ffn_hidden_size = 11008
+    # Feed-forward / MLP hidden size
+    cfg.ffn_hidden_size = getattr(runtime_args, "ffn_hidden_size", 14336)
 
     # SwiGLU (SiLU-gate) activation.
-    cfg.activation_func = torch.nn.functional.silu
-    cfg.gated_linear_unit = True
+    if getattr(runtime_args, "swiglu", True):
+        cfg.activation_func = torch.nn.functional.silu
+        cfg.gated_linear_unit = True
 
     # Normalisation – RMSNorm
-    cfg.normalization = "RMSNorm"
-    cfg.rms_norm_eps = 1e-5
+    cfg.normalization = getattr(runtime_args, "normalization", "RMSNorm")
+    cfg.rms_norm_eps = getattr(runtime_args, "norm_epsilon", 1e-5)
 
     # Positional embeddings – RoPE.
-    cfg.position_embedding_type = "rope"
-    cfg.rotary_base = 10000
-    cfg.rotary_percent = 1.0
+    cfg.position_embedding_type = getattr(runtime_args, "position_embedding_type", "rope")
+    cfg.rotary_base = getattr(runtime_args, "rotary_base", 10000)
+    cfg.rotary_percent = getattr(runtime_args, "rotary_percent", 1.0)
 
     # Sequence length.
-    cfg.seq_length = 4096
-    cfg.max_position_embeddings = 4096
+    cfg.seq_length = getattr(runtime_args, "seq_length", 4096)
+    cfg.max_position_embeddings = getattr(runtime_args, "max_position_embeddings", 4096)
 
     # Attention / dropout.
-    cfg.attention_dropout = 0.0
-    cfg.hidden_dropout = 0.0
+    cfg.attention_dropout = getattr(runtime_args, "attention_dropout", 0.0)
+    cfg.hidden_dropout = getattr(runtime_args, "hidden_dropout", 0.0)
 
-    # GQA disabled (queries == heads).
-    cfg.num_query_groups = 32
+    # GQA
+    if getattr(runtime_args, "group_query_attention", False):
+        cfg.num_query_groups = getattr(runtime_args, "num_query_groups", 8)
+    else:
+        cfg.num_query_groups = num_attention_heads
 
     # Bias usage.
-    cfg.add_bias_linear = False
+    cfg.add_bias_linear = getattr(runtime_args, "add_bias_linear", False)
+    if getattr(runtime_args, "disable_bias_linear", False):
+        cfg.add_bias_linear = False
 
     # Weight sharing.
-    cfg.untie_embeddings_and_output_weights = False
+    cfg.untie_embeddings_and_output_weights = getattr(runtime_args, "untie_embeddings_and_output_weights", False)
 
     # Kernel / TE fusions.
-    cfg.bias_activation_fusion = True
-    cfg.masked_softmax_fusion = True
-    cfg.persist_layer_norm = True
-    cfg.bias_dropout_fusion = True
-    cfg.apply_rope_fusion = True
+    cfg.bias_activation_fusion = getattr(runtime_args, "bias_activation_fusion", True)
+    
+    cfg.masked_softmax_fusion = getattr(runtime_args, "masked_softmax_fusion", True)
+    if getattr(runtime_args, "no_masked_softmax_fusion", False):
+        cfg.masked_softmax_fusion = False
+        
+    cfg.persist_layer_norm = getattr(runtime_args, "persist_layer_norm", True)
+    cfg.bias_dropout_fusion = getattr(runtime_args, "bias_dropout_fusion", True)
+    cfg.apply_rope_fusion = getattr(runtime_args, "apply_rope_fusion", True)
+
+    # MoE support
+    if hasattr(runtime_args, 'num_experts') and runtime_args.num_experts is not None:
+        cfg.num_moe_experts = runtime_args.num_experts
+        cfg.moe_router_topk = getattr(runtime_args, 'moe_router_topk', 2)
+        cfg.expert_model_parallel_size = getattr(runtime_args, 'expert_model_parallel_size', 1)
+        cfg.moe_router_load_balancing_type = getattr(runtime_args, 'moe_router_load_balancing_type', 'sinkhorn')
+        cfg.moe_grouped_gemm = getattr(runtime_args, 'moe_grouped_gemm', False)
+        if getattr(runtime_args, 'moe_ffn_hidden_size', None) is not None:
+            cfg.moe_ffn_hidden_size = runtime_args.moe_ffn_hidden_size
+        elif cfg.ffn_hidden_size is not None:
+            cfg.moe_ffn_hidden_size = cfg.ffn_hidden_size
 
     # Apply user overrides last.
     if config is not None:
@@ -102,7 +134,14 @@ def get_llava_projection_config(
 
 def get_vicuna_language_layer_spec() -> ModuleSpec:
     """Layer spec for the language model (Transformer-Engine GPT block)."""
-    return get_gpt_layer_with_transformer_engine_spec()
+    runtime_args = get_args()
+    num_experts = getattr(runtime_args, "num_experts", None)
+    moe_grouped_gemm = getattr(runtime_args, "moe_grouped_gemm", False)
+    
+    return get_gpt_layer_with_transformer_engine_spec(
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+    )
 
 def get_llava_projection_layer_spec() -> ModuleSpec:
     """Layer spec for the vision-projection MLP."""

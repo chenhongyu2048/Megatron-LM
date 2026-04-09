@@ -111,7 +111,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         data = None
     src = get_tensor_model_parallel_src_rank()
     group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+    torch.distributed.broadcast(has_data, src, group=group) # type: ignore
 
     if has_data.item() == 0:
         # iterator exhausted on all ranks
@@ -236,6 +236,8 @@ def model_provider(
             explicitly rather than fetched from global parallel state.
     """
     runtime_args = get_args()
+    print_rank_0(f"Args received in model_provider: {runtime_args}")
+    
     pg_collection = framework_kwargs.get('pg_collection')
 
     try:
