@@ -16,18 +16,65 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.models.vision.vit_layer_specs import (
+    get_vit_layer_with_transformer_engine_spec,
+    get_vit_layer_with_local_spec
+)
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import get_args
 
+###############################################################################
+# LLaVA VLM configuration utilities
+###############################################################################
 
-def get_vicuna_language_model_config(  
+def get_vision_encoder_config(
+    config: Optional[TransformerConfig] = None
+) -> TransformerConfig:
+    """Return a TransformerConfig for the CLIP ViT-L/14 vision encoder."""
+    
+    runtime_args = get_args()
+    
+    cfg = TransformerConfig(
+        num_layers=2, # for testing, set num_layers to 2. The original paper uses 24 layers for ViT-L/14.
+        hidden_size=1024,
+        num_attention_heads=16,
+        ffn_hidden_size=4096
+    )
+    
+    # QuickGELU activation.
+    cfg.activation_func = torch.nn.functional.gelu
+    cfg.gated_linear_unit = False
+
+    # Normalisation – LayerNorm
+    cfg.normalization = "LayerNorm"
+    cfg.layernorm_epsilon = 1e-5
+
+    # Positional embeddings – learned absolute position embeddings.
+    cfg.position_embedding_type = "learned_absolute"
+    
+    # Sequence length.
+    cfg.seq_length = getattr(runtime_args, "seq_length", 576) # 336 / 14 = 24，24 * 24 = 576
+    cfg.max_position_embeddings = getattr(runtime_args, "max_position_embeddings", 576)
+    
+    # Attention / dropout.
+    cfg.attention_dropout = 0.0
+    cfg.hidden_dropout = 0.0
+
+    # Allow caller overrides.
+    if config is not None:
+        for field, value in vars(config).items():
+            setattr(cfg, field, value)
+
+    return cfg
+
+def get_language_model_config(  
     config: Optional[TransformerConfig] = None,
 ) -> TransformerConfig:
-    """Return a TransformerConfig tuned for **Vicuna-7B**.
+    """Return a TransformerConfig.
 
-    The hyper-parameters follow the published Vicuna-7B weights (same sizes as
+    Current hyper-parameters follow the published Vicuna-7B weights (same sizes as
     Llama-7B).
     """
 
@@ -113,12 +160,13 @@ def get_vicuna_language_model_config(
 
 def get_llava_projection_config( 
     hidden_size: int = 4096,
+    ffn_hidden_size: int = 4096,
     config: Optional[TransformerConfig] = None,
 ) -> TransformerConfig:
     """Return a TransformerConfig for the vision projection MLP."""
 
     cfg = TransformerConfig(num_layers=1, hidden_size=hidden_size, num_attention_heads=1)
-    cfg.ffn_hidden_size = 4096
+    cfg.ffn_hidden_size = ffn_hidden_size
     cfg.bias_activation_fusion = True
     cfg.add_bias_linear = True
     cfg.activation_func = torch.nn.functional.gelu
@@ -130,9 +178,16 @@ def get_llava_projection_config(
 
     return cfg
 
+###############################################################################
+# LLaVA VLM layer specs
+###############################################################################
 
+def get_vision_encoder_layer_spec() -> ModuleSpec:
+    """Layer spec for the CLIP ViT-L/14 vision encoder."""
+    return get_vit_layer_with_transformer_engine_spec()
+    # return get_vit_layer_with_local_spec()
 
-def get_vicuna_language_layer_spec() -> ModuleSpec:
+def get_language_model_layer_spec() -> ModuleSpec:
     """Layer spec for the language model (Transformer-Engine GPT block)."""
     runtime_args = get_args()
     num_experts = getattr(runtime_args, "num_experts", None)

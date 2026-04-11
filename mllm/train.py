@@ -27,12 +27,12 @@ from megatron.core.parallel_state import (
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
-from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
-from data.mock import (
+from mllm.data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
+from mllm.data.mock import (
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 )
-from model_providers.llava_vlm import model_provider_llava_vlm
-from utils.data_helpers import broadcast_nested_data_batch
+from mllm.model_providers.llava_vlm import model_provider_llava_vlm
+from mllm.utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
 
@@ -57,12 +57,12 @@ def add_mimo_args(parser):
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
-    group.add_argument('--image-size', type=int, default=224, help='Image size for vision encoder')
-    group.add_argument('--total-seq-length', type=int, default=512, help='Total sequence length')
+    group.add_argument('--image-size', type=int, default=336, help='Image size for vision encoder')
+    group.add_argument('--total-seq-length', type=int, default=2048, help='Total sequence length')
     group.add_argument('--pad-token-id', type=int, default=0, help='Padding token ID')
     group.add_argument('--image-token-id', type=int, default=32000, help='Image token ID')
     group.add_argument(
-        '--image-seq-length', type=int, default=197, help='Number of image tokens to pad'
+        '--image-seq-length', type=int, default=576, help='Number of image tokens to pad'
     )
     group.add_argument(
         '--audio-encoder-model', type=str, default=None, help='Audio encoder model name'
@@ -78,8 +78,6 @@ def add_mimo_args(parser):
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
     
     return parser
-
-
 
 def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     """Generate a batch for MIMO model training.
@@ -180,6 +178,12 @@ def forward_step(data_iterator, model):
         tuple: (output_tensor, loss_function)
     """
     data_batch = get_batch(data_iterator)
+    if "modality_inputs" in data_batch:
+        for modality in data_batch["modality_inputs"].values():
+            for encoder_name, encoder_inputs in modality.items():
+                for k, v in encoder_inputs.items():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point():
+                        encoder_inputs[k] = v.to(dtype=torch.bfloat16)
     output_tensor, loss_mask = model(**data_batch)
     
     # Return output and loss function

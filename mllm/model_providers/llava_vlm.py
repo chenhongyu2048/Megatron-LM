@@ -2,24 +2,26 @@
 """Model provider for a LLaVA-style Vision-Language Model.
 
 This provider assembles a MIMO model that consists of:
-• Vicuna-7B language model (Llama-based) built with Transformer-Engine GPT blocks.
+• Language model (Dense or MoE) built with Transformer-Engine GPT blocks.
 • CLIP ViT-L/14 visual encoder (336 px) that produces image patch embeddings.
-• A 2-layer MLP projector that maps vision embeddings into Vicuna hidden size.
+• A 2-layer MLP projector that maps vision embeddings into language model hidden size.
 """
 
 
 import torch
-from configs.llava_vlm import (
+from mllm.configs.llava_vlm import (
+    get_vision_encoder_config,
     get_llava_projection_config,
     get_llava_projection_layer_spec,
-    get_vicuna_language_layer_spec,
-    get_vicuna_language_model_config,
+    get_vision_encoder_layer_spec,
+    get_language_model_layer_spec,
+    get_language_model_config,
 )
 
-from model_providers.hf_clip_encoder import HFCLIPEncoderWrapper
 from utils.logging import print_mimo_structure
 from utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
@@ -37,20 +39,21 @@ def model_provider_llava_vlm(
 ):
     """
     Build a LLaVA-style Vision-Language MIMO model composed of:
-    • Vicuna language model.
+    • A Dense/MoE language model.
     • CLIP ViT-L/14 vision encoder.
     • 2-layer MLP vision→language projector.
     """
     # NOTE: Pipeline parallelism for the encoder/decoder is not yet supported in this
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.
+    
+    # Vision
+    vision_config = get_vision_encoder_config()
 
-    # Language (Vicuna-7B)
-    language_config = get_vicuna_language_model_config()
+    # Language
+    language_config = get_language_model_config()
 
-    # Vision→language projection MLP – hidden size follows Vicuna (4096)
-    projection_config = get_llava_projection_config(
-        hidden_size=language_config.hidden_size
-    )
+    # Vision→language projection MLP – hidden size follows Language model (4096)
+    projection_config = get_llava_projection_config(hidden_size=language_config.hidden_size, ffn_hidden_size=language_config.hidden_size)
 
     # Sync precision flags from global args (if we're running under Megatron training loop)
     try:
@@ -58,13 +61,16 @@ def model_provider_llava_vlm(
 
         _args = get_args()
         if getattr(_args, "bf16", False):
+            vision_config.bf16 = True
             language_config.bf16 = True
             projection_config.bf16 = True
         if getattr(_args, "fp16", False):
+            vision_config.fp16 = True
             language_config.fp16 = True
             projection_config.fp16 = True
         
         # Sync parallelism flags
+        # TODO: should we set vision encoder parallelism configs here?
         if hasattr(_args, 'context_parallel_size'):
             language_config.context_parallel_size = _args.context_parallel_size
         if hasattr(_args, 'sequence_parallel'):
@@ -78,10 +84,19 @@ def model_provider_llava_vlm(
     except (ModuleNotFoundError, AssertionError):
         pass # Args not available (e.g. not in Megatron training context)
 
-    # HF encoder
+    # Megatron's clip vit encoder
     vision_encoder = ModuleSpec(
-        module=HFCLIPEncoderWrapper,
-        params={"is_video_input" : is_video_input},
+        module=CLIPViTModel,
+        params={
+            "transformer_config": vision_config,
+            "transformer_layer_spec": get_vision_encoder_layer_spec(),
+            "add_class_token": False, # LLaVA does not use class token, and we want to keep all patch tokens
+            "class_token_len": 0, # LLaVA does not use class token
+            "patch_dim": 14,          # patch_size
+            "img_h": 336,             # image_size
+            "img_w": 336,             # image_size
+            "model_subtype": "clip"
+        }
     )
 
     # Create projection config for vision to language
@@ -91,7 +106,7 @@ def model_provider_llava_vlm(
             "config": projection_config,
             "submodules": get_llava_projection_layer_spec().submodules,
             "projector_type": "mlp",
-            "input_size": 1024,
+            "input_size": 1024, # TODO: should this be the same as vision encoder hidden size instead of hardcoded? For CLIP ViT-L/14, it's 1024.
         },
     )
 
@@ -110,7 +125,7 @@ def model_provider_llava_vlm(
         module=GPTModel,
         params={
             "config": language_config,
-            "transformer_layer_spec": get_vicuna_language_layer_spec(),
+            "transformer_layer_spec": get_language_model_layer_spec(),
             "vocab_size": 32256,
             "max_sequence_length": 4096,
             "pre_process": pre_process,

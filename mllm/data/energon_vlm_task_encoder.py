@@ -18,7 +18,7 @@ sys.path.append(
         os.path.expanduser("~/run/Megatron-LM/examples/multimodal")
     )
 )
-from dataloader_provider import train_valid_test_dataloaders_provider
+from examples.multimodal.dataloader_provider import train_valid_test_dataloaders_provider
 from transformers import AutoProcessor
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -461,7 +461,7 @@ class VLMTaskEncoder(
 
         if pixel_values is not None:
             output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": pixel_values}}
+                "images": {"clip_encoder": {"x": pixel_values}}
             }
         
         return output
@@ -486,7 +486,7 @@ class VLMTaskEncoder(
 
         if pixel_values_videos is not None:
             output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": pixel_values_videos}}
+                "images": {"clip_encoder": {"x": pixel_values_videos}}
             }
 
         return output

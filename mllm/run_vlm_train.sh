@@ -69,6 +69,7 @@ TRAINING_ARGS=(
     --accumulate-allreduce-grads-in-fp32
     --model-provider llava_vlm
     --bf16
+    --use-distributed-optimizer
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -99,14 +100,14 @@ DATASET_ARGS=(
     --dataloader-type external
     --dataset-provider llava_vlm
     --data-path $DATASET_PATH
-    #--packing-buffer-size 24
-    --total-seq-length 2048
+    --packing-buffer-size 24
+    --total-seq-length 2048 # length for a single sample, including both text and image tokens
 )
 
 GPT_MODEL_ARGS=(
     --use-mcore-models
     --disable-bias-linear
-    --seq-length 4096
+    --seq-length 4096 # for model, instead of training
     # --encoder-seq-length 4096 # set seq-length or encoder-seq-length, not both
     --max-position-embeddings 4096 # instead of 32768
     --num-layers 2 # Set to a small number for testing; adjust as needed for real training
@@ -135,7 +136,7 @@ MOE_ARGS=(
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
     --moe-token-dispatcher-type alltoall
-    # --overlap-param-gather # --overlap-param-gather only supported with distributed optimizer or megatron fsdp
+    --overlap-param-gather # --overlap-param-gather only supported with distributed optimizer or megatron fsdp
     --overlap-grad-reduce # Disabled to avoid DDP bucket AssertionError caused by unused experts or unused vision branch
 )
 
