@@ -1,10 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional
 
+import torch
 import torch.nn as nn
 
 from megatron.core.models.mimo.submodules.base import ModalitySubmodules
+
+
+logger = logging.getLogger(__name__)
 
 
 class VisionModalitySubmodules(ModalitySubmodules):
@@ -103,25 +108,39 @@ class VisionModalitySubmodules(ModalitySubmodules):
 
         return embeddings
 
-    def forward(self, encoder_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def forward(
+        self,
+        encoder_inputs: Optional[Dict[str, Any]] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Process image data through encoding and projection.
 
         Args:
             encoder_inputs: Dictionary where keys match encoder names in self.encoders
                 and values are dictionaries of encoder-specific parameters.
-                Example: {"clip": {"pixel_values": images}, "vit": {"images": vit_images}}
+                Used when this vision module is the first stage.
+            hidden_states: Hidden states from previous pipeline stage.
+                Used when this vision module is not the first stage.
 
         Returns:
             Flattened image embeddings with shape [total_embeddings, hidden_dim],
             or None if no valid inputs were provided.
         """
-        # Encode the images
-        embeddings = self.encode(encoder_inputs)
+        if self.is_first_stage:
+            if encoder_inputs is None:
+                return None
+            embeddings = self.encode(encoder_inputs)
+            if not embeddings:
+                return None
+            combined = self.combine_embeddings(embeddings)
+        else:
+            if hidden_states is None:
+                return None
+            combined = hidden_states
 
-        # If no embeddings were produced, return None
-        if not embeddings:
-            return None
+        if self.is_last_stage:
+            projected = self.project_embeddings([combined], is_input=True)
+            logger.debug(f"Projected vision embeddings shape: {projected.shape}")
+            return projected
 
-        projected = self.project_embeddings(embeddings, is_input=True)
-        logging.debug(f"Projected vision embeddings shape: {projected.shape}")
-        return projected  # [total_embeddings, hidden_dim]
+        return combined
