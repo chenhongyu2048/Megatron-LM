@@ -37,7 +37,7 @@ def get_vision_encoder_config(
     runtime_args = get_args()
     
     cfg = TransformerConfig(
-        num_layers=2, # for testing, set num_layers to 2. The original paper uses 24 layers for ViT-L/14.
+        num_layers=8, # for testing, set num_layers to 2. The original paper uses 24 layers for ViT-L/14.
         hidden_size=1024,
         num_attention_heads=16,
         ffn_hidden_size=4096
@@ -143,7 +143,6 @@ def get_language_model_config(
     if hasattr(runtime_args, 'num_experts') and runtime_args.num_experts is not None:
         cfg.num_moe_experts = runtime_args.num_experts
         cfg.moe_router_topk = getattr(runtime_args, 'moe_router_topk', 2)
-        cfg.expert_model_parallel_size = getattr(runtime_args, 'expert_model_parallel_size', 1)
         cfg.moe_router_load_balancing_type = getattr(runtime_args, 'moe_router_load_balancing_type', 'sinkhorn')
         cfg.moe_grouped_gemm = getattr(runtime_args, 'moe_grouped_gemm', False)
         if getattr(runtime_args, 'moe_ffn_hidden_size', None) is not None:

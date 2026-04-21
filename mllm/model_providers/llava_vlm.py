@@ -9,6 +9,7 @@ This provider assembles a MIMO model that consists of:
 
 
 import torch
+from megatron.training.utils import print_rank_0
 from mllm.configs.llava_vlm import (
     get_vision_encoder_config,
     get_llava_projection_config,
@@ -55,7 +56,7 @@ def model_provider_llava_vlm(
     # Vision→language projection MLP – hidden size follows Language model (4096)
     projection_config = get_llava_projection_config(hidden_size=language_config.hidden_size, ffn_hidden_size=language_config.hidden_size)
 
-    # Sync precision flags from global args (if we're running under Megatron training loop)
+    # Sync precision and parallelism flags from global args (if we're running under Megatron training loop)
     try:
         from megatron.training import get_args  # late import to avoid circular deps
 
@@ -70,12 +71,31 @@ def model_provider_llava_vlm(
             projection_config.fp16 = True
         
         # Sync parallelism flags
-        # TODO: should we set vision encoder parallelism configs here?
+        # we set cp/sp here for both vision and language configs
         if hasattr(_args, 'context_parallel_size'):
             language_config.context_parallel_size = _args.context_parallel_size
+            vision_config.context_parallel_size = 1 # CP not currently supported for vision encoder
+        if hasattr(_args, 'cp_comm_type') and _args.cp_comm_type is not None:
+            # print_rank_0(f"Setting cp_comm_type from args: {_args.cp_comm_type}") # Setting cp_comm_type from args: ['p2p']
+            # so transfer it to a str, because we don't want to have a list in the config which will cause issues when we try to use it in the attention module
+            if isinstance(_args.cp_comm_type, list) and len(_args.cp_comm_type) == 1:
+                language_config.cp_comm_type = _args.cp_comm_type[0]  # 'p2p' str
+                vision_config.cp_comm_type = None # CP not currently supported for vision encoder, so set to None
+            else:
+                language_config.cp_comm_type = _args.cp_comm_type
+                vision_config.cp_comm_type = None # CP not currently supported for vision encoder, so set to None
         if hasattr(_args, 'sequence_parallel'):
             language_config.sequence_parallel = _args.sequence_parallel
-
+            vision_config.sequence_parallel = False # sequence parallel not currently supported for vision encoder
+        # set tp/ep here for vision and language distinctly since we may want to use different parallelism for the vision and language parts
+        if hasattr(_args, 'tensor_model_parallel_size'):
+            language_config.tensor_model_parallel_size = _args.tensor_model_parallel_size
+            vision_config.tensor_model_parallel_size = _args.tensor_model_parallel_size
+        if hasattr(_args, 'expert_model_parallel_size'):
+            language_config.expert_model_parallel_size = _args.expert_model_parallel_size
+        if hasattr(_args, 'expert_tensor_parallel_size'):
+            language_config.expert_tensor_parallel_size = _args.expert_tensor_parallel_size
+        
         # Determine kv_format based on sequence packing
         current_kv_format = "sbhd"
         if getattr(_args, "pack_sequence", False):
@@ -140,6 +160,10 @@ def model_provider_llava_vlm(
         modality_submodules_spec={"images": vision_submodule_spec},
         special_token_ids={"images": image_special_token_id}
     )
+    # # print configs for debugging
+    # print_rank_0(f"Vision encoder config: {vision_config}")
+    # print_rank_0(f"Language model config: {language_config}")
+    # print_rank_0(f"Projection config: {projection_config}")
 
     # Create MIMO model
     cp_group = pg_collection.cp if pg_collection is not None else None

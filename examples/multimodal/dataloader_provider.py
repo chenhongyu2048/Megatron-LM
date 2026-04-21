@@ -144,9 +144,9 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
         EnergonDataloader(get_loader(valid_ds, worker_config=worker_config))
         for valid_ds in valid_ds1
     ]
-    test_dataloader = None
+    test_dataloader = EnergonDataloader(get_loader(test_ds, worker_config=worker_config)) if test_ds is not None else None
 
-    return EnergonDataloader(train_dataloader), valid_dataloader, EnergonDataloader(test_dataloader)
+    return EnergonDataloader(train_dataloader), valid_dataloader, test_dataloader if test_ds is not None else EnergonDataloader(train_dataloader)
 
 
 class EnergonDataloader:

@@ -26,7 +26,7 @@ if [ "$1" = "-d" ]; then
 fi
 
 mbs=4
-gbs=128
+gbs=8 # set global batch size to be the same with micro batch size for testing; adjust as needed for real training
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs
@@ -50,13 +50,16 @@ DISTRIBUTED_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --context-parallel-size 2
+    # --context-parallel-size 2
+    # --cp-comm-type p2p
     --expert-model-parallel-size 2
+    --expert-tensor-parallel-size 1
+    # --sequence-parallel # enabled when tp is also enabled
 )
 
 TRAINING_ARGS=(
     --micro-batch-size $mbs
-    --global-batch-size $gbs 
+    --global-batch-size $gbs
     --train-iters 50 # Set to a small number for testing; adjust as needed for real training
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -64,7 +67,7 @@ TRAINING_ARGS=(
     --lr-decay-style cosine 
     --min-lr 2.0e-5
     --lr-warmup-iters 150
-    --lr-decay-iters 2200 
+    --lr-decay-iters 2200
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
     --model-provider llava_vlm
@@ -73,11 +76,14 @@ TRAINING_ARGS=(
 )
 
 EVAL_AND_LOGGING_ARGS=(
+    # --logging-level 10
+    --timing-log-level 2
+    --timing-log-option all
     --log-interval 10
     --save-interval 2000 
     --eval-interval 20000 
     # --save $CHECKPOINT_STORE_PATH 
-    --eval-iters 10
+    --eval-iters 1
     # --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --wandb-project $WANDB_PROJECT
     # --wandb-exp-name $EXP_NAME
@@ -100,7 +106,7 @@ DATASET_ARGS=(
     --dataloader-type external
     --dataset-provider llava_vlm
     --data-path $DATASET_PATH
-    --packing-buffer-size 24
+    # --packing-buffer-size 24 # enable this will cause error
     --total-seq-length 2048 # length for a single sample, including both text and image tokens
 )
 

@@ -1393,6 +1393,12 @@ class SelfAttention(Attention):
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
+        # # check if context parallelism is enabled and if this layer is within the context parallel region
+        # from megatron.core import parallel_state
+        # rank = parallel_state.get_context_parallel_rank()
+        # cp_size = parallel_state.get_context_parallel_world_size()
+        # print(f"[CP rank {rank}/{cp_size}] hidden_states shape: {hidden_states.shape}")
+        
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)

@@ -36,6 +36,19 @@ from mllm.utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
 
+from mllm.profiler.layer_profiler import MimoLayerProfiler
+# from mllm.profiler.frozen_check import frozen_check_on_mimo_model
+from megatron.training import get_timers
+from megatron.training import get_args
+
+PROFILE_START_ITER = 40
+PROFILE_END_ITER = 50
+_FORWARD_TRAIN_STEP_COUNT = 0
+_FORWARD_EVAL_STEP_COUNT = 0
+_profile_logged = False
+_profiler: MimoLayerProfiler = None
+# _checker = None
+
 _MODEL_PROVIDERS = {
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
@@ -129,6 +142,25 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
     batch = broadcast_nested_data_batch(data) # type: ignore
+    
+    # # loop print batch keys and tensor shapes for debugging
+    # def _print_shapes(d, indent=0):
+    #     if isinstance(d, dict):
+    #         for k, v in d.items():
+    #             if isinstance(v, dict):
+    #                 print("  " * indent + f"'{k}':")
+    #                 _print_shapes(v, indent + 1)
+    #             elif hasattr(v, 'shape'):
+    #                 print("  " * indent + f"'{k}': Tensor(shape={v.shape}, dtype={v.dtype}, device={v.device})")
+    #             else:
+    #                 print("  " * indent + f"'{k}': {type(v).__name__}")
+    #     else:
+    #         if hasattr(d, 'shape'):
+    #             print("  " * indent + f"Tensor(shape={d.shape}, dtype={d.dtype}, device={d.device})")
+    #         else:
+    #             print("  " * indent + type(d).__name__)
+    # print("[get_batch] Batch structure:")
+    # _print_shapes(batch)
 
     return batch
 
@@ -177,13 +209,50 @@ def forward_step(data_iterator, model):
     Returns:
         tuple: (output_tensor, loss_function)
     """
+    global _profile_logged
+    global _FORWARD_TRAIN_STEP_COUNT, _FORWARD_EVAL_STEP_COUNT
+    if model.training:
+        _FORWARD_TRAIN_STEP_COUNT += 1
+        print_rank_0(f"Train step at iteration {_FORWARD_TRAIN_STEP_COUNT}")
+    else:
+        _FORWARD_EVAL_STEP_COUNT += 1
+        print_rank_0(f"Eval forward step at iteration {_FORWARD_EVAL_STEP_COUNT}")
+        
+    # if _FORWARD_TRAIN_STEP_COUNT == 2:
+    #     # On the first forward step, check that the expected parameters are frozen/unfrozen as intended.
+    #     if _checker is not None:
+    #         _checker.report_grad_status()
+    #         _checker.cleanup() # Remove hooks after the first check to avoid overhead on subsequent iterations
+
+    # ---- profiler ----
+    if model.training and _profiler is not None:
+        if _FORWARD_TRAIN_STEP_COUNT == PROFILE_START_ITER:
+            _profiler.reset_timers()
+            _profiler.enable()
+            if torch.distributed.get_rank() == 0:
+                print(f"[Profiler] enabled at iteration {_FORWARD_TRAIN_STEP_COUNT}")
+
+        if _FORWARD_TRAIN_STEP_COUNT == PROFILE_END_ITER and not _profile_logged:
+            _profiler.disable()
+            torch.cuda.synchronize()
+            num_profiled = PROFILE_END_ITER - PROFILE_START_ITER
+            _profiler.print_results(num_iters=num_profiled)
+            _profiler.remove_hooks()
+            _profile_logged = True
+            if torch.distributed.get_rank() == 0:
+                print(f"[Profiler] disabled and hooks removed at iteration {_FORWARD_TRAIN_STEP_COUNT}")
+                
     data_batch = get_batch(data_iterator)
+    # if model.training and data_batch is not None:
+    #     print_rank_0(f"Iter: {_FORWARD_TRAIN_STEP_COUNT} Data batch: {data_batch}")
+    # For vision inputs, convert to bfloat16 if not already in that precision for efficiency
     if "modality_inputs" in data_batch:
         for modality in data_batch["modality_inputs"].values():
             for encoder_name, encoder_inputs in modality.items():
                 for k, v in encoder_inputs.items():
                     if isinstance(v, torch.Tensor) and v.is_floating_point():
                         encoder_inputs[k] = v.to(dtype=torch.bfloat16)
+    # Forward pass through the model
     output_tensor, loss_mask = model(**data_batch)
     
     # Return output and loss function
@@ -266,13 +335,24 @@ def model_provider(
     else:
         raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
 
-    return builder_fn(
+    model = builder_fn(
         pre_process,
         post_process,
         add_encoder,
         add_decoder,
         **builder_kwargs,
     )
+    print(f"[MODEL]: {model}")
+    
+    # global _checker
+    # if _checker is None:
+    #     _checker = frozen_check_on_mimo_model(model, check_grad_after_backward=True, verbose=False)
+    global _profiler
+    if _profiler is None:
+        _profiler = MimoLayerProfiler(get_timers(), enabled=False)
+    _profiler.register_on_mimo_model(model)
+    
+    return model
 
 if __name__ == "__main__":
     

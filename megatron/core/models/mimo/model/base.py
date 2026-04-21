@@ -526,6 +526,16 @@ class MimoModel(MegatronModule):
                 and modality_inputs[modality_name] is not None
             ):
                 logger.debug(f"Processing {modality_name} modality")
+                # # check if all clip models receive the same input across different ranks
+                # import hashlib
+                # import torch.distributed as dist
+                # rank = dist.get_rank()
+                # images = modality_inputs[modality_name]["clip_encoder"]["x"]
+                # input_sum = images.sum().item()
+                # input_hash = hashlib.md5(images.cpu().to(torch.float32).numpy().tobytes()).hexdigest()
+                # print(f"[Rank {rank}] CLIP input sum: {input_sum}, hash: {input_hash}, shape: {images.shape}")
+                
+                # Get embeddings for this modality
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
                     modality_embeddings[modality_name] = embeddings
