@@ -279,15 +279,25 @@ def forward_step_calc_loss(
     if config.timers is not None:
         config.timers('forward-compute').stop()
 
+    device = None
+    if isinstance(output_tensor, torch.Tensor):
+        device = output_tensor.device
+    elif isinstance(output_tensor, dict):
+        device = next((v.device for v in output_tensor.values() if isinstance(v, torch.Tensor)), None)
+    elif isinstance(output_tensor, (list, tuple)):
+        device = next((v.device for v in output_tensor if isinstance(v, torch.Tensor)), None)
+    if device is None:
+        device = torch.cuda.current_device()
+
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -300,9 +310,9 @@ def forward_step_calc_loss(
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:

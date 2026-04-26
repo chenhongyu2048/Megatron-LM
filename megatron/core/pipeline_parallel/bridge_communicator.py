@@ -353,7 +353,7 @@ class BridgeCommunicator:
                 self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
                 for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
                     logging.debug(
-                        f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
+                        f"[Bridge Communicator] [send_forward] Rank {self.current_rank} "
                         f"send to rank {dest_rank}"
                     )
                     dist.send(tensor_split, dst=dest_rank)
