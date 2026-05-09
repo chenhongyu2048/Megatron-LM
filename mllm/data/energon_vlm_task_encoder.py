@@ -165,9 +165,10 @@ class VLMTaskEncoder(
         conversation = []
         for turn_idx, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
             content = []
-            if turn_idx == 0:
-                # Tell the processor where to insert image tokens
-                content.append({"type": "image"})
+            # <image> is already added in dataset convertation
+            # if turn_idx == 0:
+            #     # Tell the processor where to insert image tokens
+            #     content.append({"type": "image"})
             content.append({"type": "text", "text": u_txt})
 
             conversation.append(
@@ -576,7 +577,7 @@ def build_vlm_dataloader(
     is_video_input: bool = False,
     cp_size: int = 1,
     tp_size: int = 1,
-):
+) -> EnergonDataloader:
     """Build an Energon dataloader for a specific DP group.
 
     Unlike ``llava_vlm_dataloader_provider`` which reads world size / rank

@@ -129,13 +129,13 @@ def model_provider_llava_vlm(
             lm_cp = dist.get_world_size(language_pg_collection.cp)
             global_cp = getattr(_args, 'context_parallel_size', 1)
             language_config.context_parallel_size = lm_cp
-            print_rank_0(
+            print(
                 f"[llava_vlm] language_config.context_parallel_size overridden: "
                 f"global={global_cp} -> pgc.cp={lm_cp}"
             )
         if language_pg_collection.tp is not None and dist.get_world_size(language_pg_collection.tp) > 1:
             language_config.sequence_parallel = getattr(_args, 'sequence_parallel', False)
-            print_rank_0(
+            print(
                 f"[llava_vlm] language_config.sequence_parallel overridden: "
                 f"tp_size={dist.get_world_size(language_pg_collection.tp)}, "
                 f"sp={language_config.sequence_parallel}"

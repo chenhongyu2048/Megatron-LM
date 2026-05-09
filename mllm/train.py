@@ -581,10 +581,11 @@ def run():
             llm_dp_rank = dist.get_rank(language_pgc.dp)
             llm_cp_size = dist.get_world_size(language_pgc.cp) if language_pgc.cp else 1
             llm_tp_size = dist.get_world_size(language_pgc.tp) if language_pgc.tp else 1
-            print_rank_0(
-                f"[dataloader] LLM: dp_rank={llm_dp_rank}, dp_size={args.llm_dp}, "
-                f"batch_size={llm_mbs}, cp_size={llm_cp_size}, tp_size={llm_tp_size}"
-            )
+            if dist.get_rank() == enc_world:
+                print(
+                    f"[dataloader] LLM: dp_rank={llm_dp_rank}, dp_size={args.llm_dp}, "
+                    f"batch_size={llm_mbs}, cp_size={llm_cp_size}, tp_size={llm_tp_size}"
+                )
             data_iterator = build_vlm_dataloader(
                 dp_rank=llm_dp_rank,
                 dp_world_size=args.llm_dp,
