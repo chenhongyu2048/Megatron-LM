@@ -9,14 +9,11 @@ from enum import Enum
 from typing import Dict, List, Union, Iterable, Tuple, Optional, Protocol
 import heapq
 import torch
+import torch.distributed as dist
 import torch.nn.utils.rnn as rnn_utils
 
-# TODO: ykarnati, use absolute import or 
-# define train_valid_test_dataloaders_provider in here
 sys.path.append(
-    os.path.abspath(
-        os.path.expanduser("~/run/Megatron-LM/examples/multimodal")
-    )
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, "examples", "multimodal"))
 )
 from examples.multimodal.dataloader_provider import train_valid_test_dataloaders_provider
 from transformers import AutoProcessor
@@ -27,6 +24,7 @@ from megatron.energon import (
     VQASample,
     WorkerConfig,
     get_loader,
+    get_savable_loader,
     get_train_dataset,
 )
 from megatron.energon.task_encoder.base import stateless
@@ -115,6 +113,8 @@ class VLMTaskEncoder(
         processor,
         conversation_template_config: Optional[ConversationTemplateConfig] = None,
         max_seq_length: Optional[int] = None,
+        cp_size: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         """Initialize VLMTaskEncoder.
 
@@ -124,17 +124,26 @@ class VLMTaskEncoder(
             conversation_template_config (Optional[ConversationTemplateConfig]): Configuration for conversation templates.
             max_seq_length (Optional[int]): Maximum sequence length for packing. Should be sum of max_text_length
                 and image_seq_length. If None, defaults to 4096. This value is used as group_size for sequence packing.
+            cp_size: Context parallel size for padding. Falls back to global args if None.
+            tp_size: Tensor parallel size for padding. Falls back to global args if None.
         """
         self.model_type = model_type
         # Use max_seq_length if provided, otherwise default to 4096
         self.group_size = max_seq_length if max_seq_length is not None else 4096
         self.processor = processor
         self.conversation_template_config = conversation_template_config
-        # Read parallelism settings directly from training args (these live in TransformerConfig).
+        # Read parallelism settings: prefer explicit params (from heterogeneous CP/TP),
+        # fall back to global args for backward compatibility.
         _args = get_args()
-        self._cp_size = getattr(_args, 'context_parallel_size', 1)
-        self._tp_size = getattr(_args, 'tensor_model_parallel_size', 1)
+        self._cp_size = cp_size if cp_size is not None else getattr(_args, 'context_parallel_size', 1)
+        self._tp_size = tp_size if tp_size is not None else getattr(_args, 'tensor_model_parallel_size', 1)
         self._sequence_parallel = getattr(_args, 'sequence_parallel', False)
+
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(
+                f"[VLMTaskEncoder.__init__] cp_size={self._cp_size} tp_size={self._tp_size} "
+                f"sp={self._sequence_parallel}"
+            )
 
     def apply_prompt_template(self, input_text: VQASample):
         """Create conversation prompt string using HF chat template.
@@ -516,6 +525,107 @@ def llava_vlm_dataloader_provider(train_val_test_num_samples, max_seq_length: Op
             max_seq_length=max_seq_length,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Standalone dataloader builder (no dependency on global parallel_state)
+# ---------------------------------------------------------------------------
+
+def _print_error_handler(exc, key):
+    print(
+        f"The following exception occurred in the dataloader for sample {key} and is skipped",
+        file=sys.stderr,
+    )
+    import traceback
+    traceback.print_exc()
+
+
+def _cyclic_iter(it):
+    while True:
+        for x in it:
+            yield x
+
+
+class EnergonDataloader:
+    """Wrapper to use Megatron Energon dataloader with cyclic iteration.
+
+    Copied from examples/multimodal/dataloader_provider.py to avoid depending
+    on the global parallel_state used by that module.
+    """
+
+    def __init__(self, dataloader):
+        self._dataloader = dataloader
+        self._iter = iter(_cyclic_iter(dataloader))
+
+    def __next__(self):
+        return self._iter.__next__()
+
+    def __iter__(self):
+        return self._iter
+
+    def save_state(self):
+        return self._dataloader.save_state_rank()
+
+
+def build_vlm_dataloader(
+    dp_rank: int,
+    dp_world_size: int,
+    dp_group,
+    max_seq_length: int,
+    batch_size: int,
+    is_video_input: bool = False,
+    cp_size: int = 1,
+    tp_size: int = 1,
+):
+    """Build an Energon dataloader for a specific DP group.
+
+    Unlike ``llava_vlm_dataloader_provider`` which reads world size / rank
+    from the global ``parallel_state``, this function takes explicit
+    *dp_rank*, *dp_world_size* and *dp_group* so that encoder and LLM can
+    each have their own independent dataloader with different DP sizes.
+
+    The caller is responsible for setting the same random seed before
+    creating the two dataloaders so that shuffle order is identical.
+    """
+    args = get_args()
+
+    tokenizer_model_id = args.tokenizer_model
+    processor = AutoProcessor.from_pretrained(tokenizer_model_id)
+
+    model_type = ModelType.VIDEO_LLAVA_VLM if is_video_input else ModelType.LLAVA_VLM
+
+    task_encoder = VLMTaskEncoder(
+        model_type=model_type,
+        processor=processor,
+        conversation_template_config=LlavaConversationTemplateConfig(),
+        max_seq_length=max_seq_length,
+        cp_size=cp_size,
+        tp_size=tp_size,
+    )
+
+    worker_config = WorkerConfig(
+        rank=dp_rank,
+        world_size=dp_world_size,
+        num_workers=args.num_workers,
+        data_parallel_group=dp_group,
+    )
+
+    dname = args.data_path[0] if isinstance(args.data_path, list) else args.data_path
+    train_dataset = get_train_dataset(
+        dname,
+        batch_size=batch_size,
+        task_encoder=task_encoder,
+        virtual_epoch_length=1000,
+        max_samples_per_sequence=100,
+        shuffle_buffer_size=100,
+        worker_config=worker_config,
+        packing_buffer_size=args.packing_buffer_size,
+        handler=_print_error_handler,
+        image_decode="pil",
+    )
+
+    loader = get_savable_loader(train_dataset, worker_config=worker_config)
+    return EnergonDataloader(loader)
 
 
 if __name__ == "__main__":

@@ -35,9 +35,9 @@ def get_vision_encoder_config(
     """Return a TransformerConfig for the CLIP ViT-L/14 vision encoder."""
     
     runtime_args = get_args()
-    
+
     cfg = TransformerConfig(
-        num_layers=8, # for testing, set num_layers to 2. The original paper uses 24 layers for ViT-L/14.
+        num_layers=8, # for testing, set num_layers to 1. The original paper uses 24 layers for ViT-L/14.
         hidden_size=1024,
         num_attention_heads=16,
         ffn_hidden_size=4096
@@ -55,8 +55,9 @@ def get_vision_encoder_config(
     cfg.position_embedding_type = "learned_absolute"
     
     # Sequence length.
-    cfg.seq_length = getattr(runtime_args, "seq_length", 576) # 336 / 14 = 24，24 * 24 = 576
+    cfg.seq_length = getattr(runtime_args, "seq_length", 576) # 336 / 14 = 24, 24 * 24 = 576
     cfg.max_position_embeddings = getattr(runtime_args, "max_position_embeddings", 576)
+    cfg.variable_seq_lengths = True
     
     # Attention / dropout.
     cfg.attention_dropout = 0.0
@@ -109,6 +110,7 @@ def get_language_model_config(
     # Sequence length.
     cfg.seq_length = getattr(runtime_args, "seq_length", 4096)
     cfg.max_position_embeddings = getattr(runtime_args, "max_position_embeddings", 4096)
+    cfg.variable_seq_lengths = True
 
     # Attention / dropout.
     cfg.attention_dropout = getattr(runtime_args, "attention_dropout", 0.0)
@@ -143,8 +145,22 @@ def get_language_model_config(
     if hasattr(runtime_args, 'num_experts') and runtime_args.num_experts is not None:
         cfg.num_moe_experts = runtime_args.num_experts
         cfg.moe_router_topk = getattr(runtime_args, 'moe_router_topk', 2)
-        cfg.moe_router_load_balancing_type = getattr(runtime_args, 'moe_router_load_balancing_type', 'sinkhorn')
+        cfg.moe_router_load_balancing_type = getattr(runtime_args, 'moe_router_load_balancing_type', 'aux_loss')
         cfg.moe_grouped_gemm = getattr(runtime_args, 'moe_grouped_gemm', False)
+        cfg.moe_token_dispatcher_type = getattr(runtime_args, 'moe_token_dispatcher_type', 'alltoall')
+
+        # Other MoE arguments
+        cfg.moe_aux_loss_coeff = getattr(runtime_args, 'moe_aux_loss_coeff', 0.0)
+        cfg.moe_z_loss_coeff = getattr(runtime_args, 'moe_z_loss_coeff', 0.0)
+        cfg.moe_input_jitter_eps = getattr(runtime_args, 'moe_input_jitter_eps', None)
+        cfg.moe_token_drop_policy = getattr(runtime_args, 'moe_token_drop_policy', 'probs')
+        cfg.moe_expert_capacity_factor = getattr(runtime_args, 'moe_expert_capacity_factor', None)
+        cfg.moe_pad_expert_input_to_capacity = getattr(
+            runtime_args, 'moe_pad_expert_input_to_capacity', False
+        )
+        cfg.moe_router_pre_softmax = getattr(runtime_args, 'moe_router_pre_softmax', False)
+        cfg.moe_permute_fusion = getattr(runtime_args, 'moe_permute_fusion', False)
+
         if getattr(runtime_args, 'moe_ffn_hidden_size', None) is not None:
             cfg.moe_ffn_hidden_size = runtime_args.moe_ffn_hidden_size
         elif cfg.ffn_hidden_size is not None:
@@ -169,6 +185,7 @@ def get_llava_projection_config(
     cfg.bias_activation_fusion = True
     cfg.add_bias_linear = True
     cfg.activation_func = torch.nn.functional.gelu
+    cfg.variable_seq_lengths = True
 
     # Allow caller overrides.
     if config is not None:

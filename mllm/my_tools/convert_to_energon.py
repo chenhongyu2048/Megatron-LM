@@ -4,7 +4,7 @@ import json
 from datasets import load_from_disk
 import webdataset as wds
 
-SAMPLES_PER_SHARD = 1000  # 每个 tar 包的样本数，可按需调整
+SAMPLES_PER_SHARD = 1000  # samples per tar shard, adjust as needed
 
 def format_scienceqa(hf_sample, idx):
     question = hf_sample["question"]
@@ -18,13 +18,13 @@ def format_scienceqa(hf_sample, idx):
 
     sample = {
         "__key__": f"scienceqa_{idx:07d}",
-        # 将 context 和 answers 分别存为不同扩展名的文件
+        # store context and answers as files with different extensions
         "context.txt": full_prompt,
         "answers.json": json.dumps([correct_answer]),
     }
 
     if image is not None:
-        # 将 PIL Image 转为 JPEG bytes
+        # convert PIL Image to JPEG bytes
         buf = io.BytesIO()
         image.save(buf, format="JPEG")
         sample["image.jpg"] = buf.getvalue() # type: ignore
@@ -39,12 +39,12 @@ def main():
     energon_out_dir = os.path.expanduser("~/run/dataset/energon_scienceqa")
     os.makedirs(energon_out_dir, exist_ok=True)
 
-    # 1. 加载 HuggingFace 数据
+    # 1. Load HuggingFace data
     print("Loading HF dataset...")
     ds = load_from_disk(hf_dir)
     train_ds = ds["train"] if "train" in ds else ds
 
-    # 2. 用 webdataset TarWriter 写入 tar 分片
+    # 2. write tar shards with webdataset TarWriter
     total = len(train_ds)
     print(f"Converting {total} samples to WebDataset tar shards...")
 
@@ -52,7 +52,7 @@ def main():
     sink = None
 
     for idx, sample in enumerate(train_ds):
-        # 每 SAMPLES_PER_SHARD 条开一个新 tar
+        # start a new tar every SAMPLES_PER_SHARD samples
         if idx % SAMPLES_PER_SHARD == 0:
             if sink is not None:
                 sink.close()

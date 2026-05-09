@@ -1,116 +1,235 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
-"""
-This script provides a basic training loop for MIMO models.
-"""
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+"""Training loop for MIMO models with heterogeneous encoder/LLM parallelism."""
 
 import os
+import random
+import numpy as np
 import sys
+from contextlib import ExitStack, contextmanager
 from functools import partial
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 _MEGATRON_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 if _MEGATRON_ROOT not in sys.path:
     sys.path.insert(0, _MEGATRON_ROOT)
 
 import torch
-from megatron.training import get_args, pretrain, print_rank_0
+import torch.distributed as dist
 
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_src_rank,
-    get_context_parallel_group,
-    get_data_parallel_group,
+from megatron.training import get_args, get_timers, print_rank_0
+from megatron.training.initialize import initialize_megatron
+from megatron.training.global_vars import set_args
+
+# ---- MIMO / parallel plumbing ------------------------------------------------
+import megatron.core.pipeline_parallel.schedules as schedule
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
+from megatron.core.pipeline_parallel.multimodule_communicator import (
+    MultiModulePipelineCommunicator,
+)
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
 )
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
-)
-from mllm.data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
-from mllm.data.mock import (
-    train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
-)
+# ---- Project-local imports ---------------------------------------------------
+from mllm.data.energon_vlm_task_encoder import llava_vlm_dataloader_provider, build_vlm_dataloader
+from mllm.data.mock import train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider
 from mllm.model_providers.llava_vlm import model_provider_llava_vlm
 from mllm.utils.data_helpers import broadcast_nested_data_batch
-
-from megatron.core.enums import ModelType
-
 from mllm.profiler.layer_profiler import MimoLayerProfiler
-# from mllm.profiler.frozen_check import frozen_check_on_mimo_model
-from megatron.training import get_timers
-from megatron.training import get_args
+from mllm.utils.pgc_helpers import attach_derived_groups
 
+# ============================================================================
+# Globals
+# ============================================================================
 PROFILE_START_ITER = 40
 PROFILE_END_ITER = 50
 _FORWARD_TRAIN_STEP_COUNT = 0
 _FORWARD_EVAL_STEP_COUNT = 0
 _profile_logged = False
 _profiler: MimoLayerProfiler = None
-# _checker = None
+
+_active_grids: list = []
+_embedding_pg_cache: dict = {}
 
 _MODEL_PROVIDERS = {
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
 }
 
-_DATASET_PROVIDERS = {
-    "mock": mock_train_valid_test_datasets_provider,
-    "llava_vlm": llava_vlm_dataloader_provider,
-    "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
-}
+ENCODER_NAME = "images"
 
+# Set by run() before forward/backward starts
+_current_tp_group = None
+_current_cp_group = None
+_current_dp_group = None
+
+# ============================================================================
+# Args
+# ============================================================================
 def add_mimo_args(parser):
-    """Add MIMO-specific arguments to the parser."""
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
+    group.add_argument('--dataset-provider', type=str, default='mock')
+    group.add_argument('--model-provider', type=str, default='mock')
 
-    # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
+    group.add_argument('--image-size', type=int, default=336)
+    group.add_argument('--total-seq-length', type=int, default=2048)
+    group.add_argument('--pad-token-id', type=int, default=0)
+    group.add_argument('--image-token-id', type=int, default=32000)
+    group.add_argument('--image-seq-length', type=int, default=576)
+    group.add_argument('--audio-encoder-model', type=str, default=None)
+    group.add_argument('--hf-assign-unused-tokens', type=str, nargs='+', default=None)
 
-    # mock dataloader related args
-    # can control mock samples with total seq length and image seq length
-    group.add_argument('--image-size', type=int, default=336, help='Image size for vision encoder')
-    group.add_argument('--total-seq-length', type=int, default=2048, help='Total sequence length')
-    group.add_argument('--pad-token-id', type=int, default=0, help='Padding token ID')
-    group.add_argument('--image-token-id', type=int, default=32000, help='Image token ID')
-    group.add_argument(
-        '--image-seq-length', type=int, default=576, help='Number of image tokens to pad'
-    )
-    group.add_argument(
-        '--audio-encoder-model', type=str, default=None, help='Audio encoder model name'
-    )
-    group.add_argument(
-        '--hf-assign-unused-tokens', type=str, nargs='+', default=None,
-                       help='Assigning unused tokens to special tokens. Example: '
-                       '--hf-assign-unused-tokens "<audio>,32002" "<video>,32003"'
-    )
-    # checkpoint related args
-    group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
-    # energon dataloader related args
-    group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
-    
+    group.add_argument('--language-model-checkpoint', type=str, default=None)
+    group.add_argument('--packing-buffer-size', type=int, default=None)
+
+    # --- NEW: heterogeneous parallelism for encoder / LLM --------------------
+    group.add_argument('--encoder-tp', type=int, default=1)
+    group.add_argument('--encoder-pp', type=int, default=1)
+    group.add_argument('--encoder-dp', type=int, default=1)
+    group.add_argument('--encoder-cp', type=int, default=1)
+    group.add_argument('--llm-tp',     type=int, default=1)
+    group.add_argument('--llm-pp',     type=int, default=1)
+    group.add_argument('--llm-dp',     type=int, default=1)
+    group.add_argument('--llm-cp',     type=int, default=1)
+    group.add_argument('--llm-etp',    type=int, default=1)
+    group.add_argument('--llm-ep',     type=int, default=1)
+    group.add_argument('--llm-edp',    type=int, default=1)
+
+    group.add_argument('--train-iters-mimo', type=int, default=1000, help='Training iterations for the MIMO custom loop.')
+    group.add_argument('--log-interval-mimo', type=int, default=10)
+
     return parser
 
-def get_batch(data_iterator: Iterator[Dict[str, Any]]):
-    """Generate a batch for MIMO model training.
 
-    Args:
-        data_iterator: Iterator over the dataset
-
-    Returns:
-        tuple: Batch data for model training
+# ============================================================================
+# Grid / PG helpers (mirrors the test file)
+# ============================================================================
+def create_hypercomm_grid_dense(offset, tp, cp, pp, dp):
     """
-    args = get_args()
-
-    # Assert that pipeline parallelism are not supported yet
-    assert (getattr(args, 'pipeline_model_parallel_size', 1) == 1), \
-        "Pipeline parallelism is not supported yet in MIMO implementation"
+    Dense communication grid. Includes placeholder size=1 dimensions
+    for ep / expt_tp for MCore DDP / MIMO optimizer compatibility.
+    """
+    grid = HyperCommGrid(
+        shape=[tp, cp, pp, dp, 1, 1], # [tp, cp, pp, dp, ep, expt_dp]
+        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        rank_offset=offset,
+        backend="nccl",
+    )
     
-    # Broadcast data - only get data on tensor parallel rank 0
-    # data iterator is None on other tp ranks
-    # TP Rank-0 reads next batch.
-    if get_tensor_model_parallel_rank() == 0:
+    grid.create_pg(["tp"])
+    grid.create_pg(["cp"])
+    grid.create_pg(["pp"])
+    grid.create_pg(["dp"])
+    grid.create_pg(["dp", "cp"])
+    grid.create_pg(["ep"])
+    grid.create_pg(["expt_dp"])
+    # Required by _get_pg_collection_for_optimizer
+    grid.create_pg(["tp", "pp"])
+    grid.create_pg(["tp", "ep", "pp"])
+    grid.create_pg(["dp", "ep"])
+    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+
+    _active_grids.append(grid)
+    return grid
+
+def create_hypercomm_grid_moe(offset, etp, ep, pp, edp):
+    """
+    Dimension meanings:
+        etp (expt_tp): tensor parallel within experts
+        ep            : expert parallel (expert sharding)
+        edp (expt_dp): expert data parallel
+    """
+    grid = HyperCommGrid(
+        shape=[etp, ep, pp, edp],
+        dim_names=["expt_tp", "ep", "pp", "expt_dp"],
+        rank_offset=offset, backend="nccl",
+    )
+    for name in ["expt_tp", "ep", "pp", "expt_dp"]:
+        grid.create_pg([name])
+
+    # Combined groups: used by MoEAlltoAllTokenDispatcher / optimizer
+    grid.create_pg(["expt_tp", "ep"])
+    grid.create_pg(["expt_tp", "ep", "pp"])
+    _active_grids.append(grid)
+    return grid
+
+def destroy_all_grids():
+    for grid in _active_grids:
+        grid.destroy()
+    _active_grids.clear()
+    _embedding_pg_cache.clear()
+    BridgeCommunicator.destroy_broadcast_pgs()
+
+def _create_all_embedding_groups(grids):
+    """Collective: must be called by ALL ranks in the same order."""
+    for grid in grids:
+        pp_group = grid.get_pg("pp")
+        if not pp_group:
+            continue
+        pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
+        key = tuple(pp_ranks)
+        if key not in _embedding_pg_cache: # avoid multiple grids on the same GPUs having the same PP group and creating duplicate groups
+            pos_embd_ranks = [pp_ranks[0]] # position embedding group is always the first PP rank
+            embd_ranks = [pp_ranks[0]]     # word embedding group starts with the first PP rank, and includes the last PP rank if it's different
+            if pp_ranks[-1] != pp_ranks[0]:
+                embd_ranks.append(pp_ranks[-1])
+            _embedding_pg_cache[key] = (
+                dist.new_group(ranks=pos_embd_ranks),
+                dist.new_group(ranks=embd_ranks),
+            )
+
+def _add_embedding_groups(pgc, is_language_model=False):
+    if not pgc.pp:
+        return pgc
+    key = tuple(sorted(dist.get_process_group_ranks(pgc.pp)))
+    pos_embd_pg, embd_pg = _embedding_pg_cache[key]
+    pgc.pos_embd = pos_embd_pg if is_pp_first_stage(pgc.pp) else None
+    if is_language_model:
+        pgc.embd = (embd_pg if (is_pp_last_stage(pgc.pp) or is_pp_first_stage(pgc.pp))else None)
+    else:
+        pgc.embd = None
+    return pgc
+
+def _is_rank_in_grid(grid):
+    r = dist.get_rank()
+    return grid.rank_offset <= r < grid.rank_offset + grid.size
+
+def _dump_pgc(name, pgc):
+    for k, v in vars(pgc).items():
+        if v is None:
+            print(f"[Rank-{dist.get_rank()}][{name}] {k}: None")
+        else:
+            print(f"[Rank-{dist.get_rank()}][{name}] {k}: size={dist.get_world_size(v)}, "
+                  f"ranks={dist.get_process_group_ranks(v)}")
+
+
+# ============================================================================
+# Batch / loss / forward step
+# ============================================================================
+def get_batch(data_iterator: Optional[Iterator[Dict[str, Any]]]):
+    """Pull a batch on TP rank-0 and broadcast across TP."""
+    if data_iterator is None:
+        # This rank does not consume input (middle/last PP stage without data role).
+        return {"input_ids": None}
+
+    # We can't rely on the global parallel_state here, so use the model's
+    # TP group via a module-level cache set by the training loop.
+    tp_group = _current_tp_group
+    tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+    tp_src = (
+        dist.get_process_group_ranks(tp_group)[0]
+        if tp_group is not None
+        else dist.get_rank()
+    )
+
+    if tp_rank == 0:
         try:
             data = next(data_iterator)
             has_data = torch.tensor([1], dtype=torch.uint8, device='cuda')
@@ -120,13 +239,11 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     else:
         has_data = torch.empty(1, dtype=torch.uint8, device='cuda')
         data = None
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group) # type: ignore
+
+    if tp_group is not None and dist.get_world_size(tp_group) > 1:
+        dist.broadcast(has_data, tp_src, group=tp_group)
 
     if has_data.item() == 0:
-        # iterator exhausted on all ranks
-        # we need this to avoid race condition when first tp rank hits StopIteration
         return None
 
     # MiMo forward pass expects 
@@ -141,27 +258,15 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # For the modality inputs, the keys can be arbitrary
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
-    batch = broadcast_nested_data_batch(data) # type: ignore
-    
-    # # loop print batch keys and tensor shapes for debugging
-    # def _print_shapes(d, indent=0):
-    #     if isinstance(d, dict):
-    #         for k, v in d.items():
-    #             if isinstance(v, dict):
-    #                 print("  " * indent + f"'{k}':")
-    #                 _print_shapes(v, indent + 1)
-    #             elif hasattr(v, 'shape'):
-    #                 print("  " * indent + f"'{k}': Tensor(shape={v.shape}, dtype={v.dtype}, device={v.device})")
-    #             else:
-    #                 print("  " * indent + f"'{k}': {type(v).__name__}")
-    #     else:
-    #         if hasattr(d, 'shape'):
-    #             print("  " * indent + f"Tensor(shape={d.shape}, dtype={d.dtype}, device={d.device})")
-    #         else:
-    #             print("  " * indent + type(d).__name__)
-    # print("[get_batch] Batch structure:")
-    # _print_shapes(batch)
+    batch = broadcast_nested_data_batch(data, tp_group=_current_tp_group)
 
+    # Cast vision float tensors to bf16
+    if "modality_inputs" in batch:
+        for modality in batch["modality_inputs"].values():
+            for _, encoder_inputs in modality.items():
+                for k, v in encoder_inputs.items():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point():
+                        encoder_inputs[k] = v.to(dtype=torch.bfloat16)
     return batch
 
 def loss_func(loss_mask, output_tensor):
@@ -174,194 +279,390 @@ def loss_func(loss_mask, output_tensor):
         tuple: (loss, num_tokens, metrics_dict)
     """
     args = get_args()
+
+    if output_tensor is None:
+        # Non-last-stage rank — return dummy loss; schedule ignores it.
+        zero = torch.tensor(0.0, device='cuda', requires_grad=True)
+        return zero, torch.tensor(0, device='cuda', dtype=torch.int), {'lm loss': zero.detach()}
+
+    # output_tensor may be a dict keyed by module name; pull the LM output.
+    if isinstance(output_tensor, dict):
+        output_tensor = output_tensor.get(
+            MIMO_LANGUAGE_MODULE_KEY, next(iter(output_tensor.values()))
+        )
+
     losses = output_tensor.float()
-
     loss_mask = loss_mask.contiguous().view(-1).float()
-
     total_tokens = loss_mask.sum().clone().detach().to(torch.int)
     total_loss = torch.sum(losses.view(-1) * loss_mask)
 
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
-
     loss_for_backward = loss[0].clone()
-    # If CP is active, reduce the loss across all CP ranks 
-    # as they have loss calculated for their own sequence shards.
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=get_context_parallel_group())
-        loss_for_backward = loss[0].clone()
-    # For reporting, clone and detach the loss. This creates a new tensor 
-    # that doesn't require gradients and is independent of the computation graph.
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=get_data_parallel_group())
 
+    if args.context_parallel_size > 1 and _current_cp_group is not None:
+        dist.all_reduce(loss, group=_current_cp_group)
+        loss_for_backward = loss[0].clone()
+
+    reporting_loss = loss.clone().detach()
+    if _current_dp_group is not None:
+        dist.all_reduce(reporting_loss, group=_current_dp_group)
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    return (loss_for_backward, local_num_tokens, {'lm loss': (reporting_loss)})
-
+    return loss_for_backward, local_num_tokens, {'lm loss': reporting_loss}
 
 def forward_step(data_iterator, model):
-    """Forward step for MIMO model training.
-
-    Args:
-        data_iterator: iterator over the dataset
-        model: MIMO model instance
-
-    Returns:
-        tuple: (output_tensor, loss_function)
-    """
-    global _profile_logged
-    global _FORWARD_TRAIN_STEP_COUNT, _FORWARD_EVAL_STEP_COUNT
+    global _profile_logged, _FORWARD_TRAIN_STEP_COUNT, _FORWARD_EVAL_STEP_COUNT
     if model.training:
         _FORWARD_TRAIN_STEP_COUNT += 1
-        print_rank_0(f"Train step at iteration {_FORWARD_TRAIN_STEP_COUNT}")
     else:
         _FORWARD_EVAL_STEP_COUNT += 1
-        print_rank_0(f"Eval forward step at iteration {_FORWARD_EVAL_STEP_COUNT}")
-        
-    # if _FORWARD_TRAIN_STEP_COUNT == 2:
-    #     # On the first forward step, check that the expected parameters are frozen/unfrozen as intended.
-    #     if _checker is not None:
-    #         _checker.report_grad_status()
-    #         _checker.cleanup() # Remove hooks after the first check to avoid overhead on subsequent iterations
 
     # ---- profiler ----
     if model.training and _profiler is not None:
         if _FORWARD_TRAIN_STEP_COUNT == PROFILE_START_ITER:
             _profiler.reset_timers()
             _profiler.enable()
-            if torch.distributed.get_rank() == 0:
-                print(f"[Profiler] enabled at iteration {_FORWARD_TRAIN_STEP_COUNT}")
-
+            if dist.get_rank() == 0:
+                print(f"[Profiler] enabled at iter {_FORWARD_TRAIN_STEP_COUNT}")
         if _FORWARD_TRAIN_STEP_COUNT == PROFILE_END_ITER and not _profile_logged:
             _profiler.disable()
             torch.cuda.synchronize()
-            num_profiled = PROFILE_END_ITER - PROFILE_START_ITER
-            _profiler.print_results(num_iters=num_profiled)
+            _profiler.print_results(num_iters=PROFILE_END_ITER - PROFILE_START_ITER)
             _profiler.remove_hooks()
             _profile_logged = True
-            if torch.distributed.get_rank() == 0:
-                print(f"[Profiler] disabled and hooks removed at iteration {_FORWARD_TRAIN_STEP_COUNT}")
-                
+
     data_batch = get_batch(data_iterator)
-    # if model.training and data_batch is not None:
-    #     print_rank_0(f"Iter: {_FORWARD_TRAIN_STEP_COUNT} Data batch: {data_batch}")
-    # For vision inputs, convert to bfloat16 if not already in that precision for efficiency
-    if "modality_inputs" in data_batch:
-        for modality in data_batch["modality_inputs"].values():
-            for encoder_name, encoder_inputs in modality.items():
-                for k, v in encoder_inputs.items():
-                    if isinstance(v, torch.Tensor) and v.is_floating_point():
-                        encoder_inputs[k] = v.to(dtype=torch.bfloat16)
-    # Forward pass through the model
+    if data_batch is None:
+        # Iterator exhausted -- build a placeholder so the schedule can still run this step
+        data_batch = {"input_ids": None}
+
     output_tensor, loss_mask = model(**data_batch)
-    
-    # Return output and loss function
     return output_tensor, partial(loss_func, loss_mask)
 
-
-def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
-    """Dataset provider for MIMO model training.
-
-    Args:
-        *provider_args: Additional arguments for the dataset provider
-        **provider_kwargs: Additional keyword arguments for the dataset provider
-    """
-    runtime_args = get_args()
+# ============================================================================
+# Model provider — uses the new heterogeneous-parallel API
+# ============================================================================
+def build_mimo_model(encoder_grid, llm_grid, encoder_pgc, language_pgc):
+    ra = get_args()
     try:
-        dataset_provider = _DATASET_PROVIDERS[runtime_args.dataset_provider]
-        if runtime_args.dataset_provider != "mock":
-            # Calculate max_seq_length from total_seq_length
-            max_seq_length = runtime_args.total_seq_length
-            print_rank_0(f"MIMO Training: Using max_seq_length = {max_seq_length} "
-                f"(total_seq_length: {runtime_args.total_seq_length})")
-
-            # Add configs to provider_kwargs
-            provider_kwargs['max_seq_length'] = max_seq_length
+        builder_fn = _MODEL_PROVIDERS[ra.model_provider]
     except KeyError as e:
-        raise ValueError(
-            f"Unsupported dataset provider '{runtime_args.dataset_provider}'. "
-            f"Available providers: {list(_DATASET_PROVIDERS.keys())}"
-        ) from e
-
-    return dataset_provider(*provider_args, **provider_kwargs)
-
-def model_provider(
-    pre_process: bool = True,
-    post_process: bool = True,
-    add_encoder: bool = True,
-    add_decoder: bool = True,
-    image_special_token_id: int = 32000,
-    audio_special_token_id: int = 32002,
-    **framework_kwargs,
-):
-    """Model provider for MIMO model training.
-
-    Args:
-        pre_process: Whether to pre-process the model
-        post_process: Whether to post-process the model
-        add_encoder: Whether to add an encoder to the model (not supported yet)(default: True)
-        add_decoder: Whether to add a decoder to the model (not supported yet)(default: True)
-        image_special_token_id: Special token ID for the image modality (default: 32000)
-        audio_special_token_id: Special token ID for the audio modality (default: 32002)
-        **framework_kwargs: Framework-injected kwargs from Megatron's training loop,
-            including `config` (TransformerConfig) and `pg_collection` (ProcessGroupCollection).
-            `pg_collection` is forwarded to the model builder so process groups are passed
-            explicitly rather than fetched from global parallel state.
-    """
-    runtime_args = get_args()
-    print_rank_0(f"Args received in model_provider: {runtime_args}")
-    
-    pg_collection = framework_kwargs.get('pg_collection')
-
-    try:
-        builder_fn = _MODEL_PROVIDERS[runtime_args.model_provider]
-    except KeyError as e:
-        raise ValueError(
-            f"Unsupported model provider '{runtime_args.model_provider}'. "
-            f"Available providers: {list(_MODEL_PROVIDERS.keys())}"
-        ) from e
-
-    if runtime_args.model_provider == "llava_vlm":
-        builder_kwargs = {
-            "image_special_token_id": image_special_token_id,
-            "pg_collection": pg_collection,
-        }
-    elif runtime_args.model_provider == "llava_avlm":
-        builder_kwargs = {
-            "image_special_token_id": image_special_token_id,
-            "audio_special_token_id": audio_special_token_id,
-            "pg_collection": pg_collection,
-        }
-    else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(f"Unsupported model provider '{ra.model_provider}'.") from e
 
     model = builder_fn(
-        pre_process,
-        post_process,
-        add_encoder,
-        add_decoder,
-        **builder_kwargs,
+        pre_process=True,           # overridden internally per-rank via pg_collection
+        post_process=True,
+        add_encoder=True,
+        add_decoder=True,
+        image_special_token_id=ra.image_token_id,
+        encoder_pg_collection=encoder_pgc,
+        language_pg_collection=language_pgc,
+        encoder_grid=encoder_grid,
+        language_grid=llm_grid,
+        encoder_name=ENCODER_NAME,
+        wrap_ddp=True,
     )
-    print(f"[MODEL]: {model}")
-    
-    # global _checker
-    # if _checker is None:
-    #     _checker = frozen_check_on_mimo_model(model, check_grad_after_backward=True, verbose=False)
-    global _profiler
-    if _profiler is None:
-        _profiler = MimoLayerProfiler(get_timers(), enabled=False)
-    _profiler.register_on_mimo_model(model)
+    model.to(torch.device("cuda")).to(torch.bfloat16)
+
+    # global _profiler
+    # if _profiler is None:
+    #     _profiler = MimoLayerProfiler(get_timers(), enabled=False)
+    # _profiler.register_on_mimo_model(model)
     
     return model
 
-if __name__ == "__main__":
+
+# ============================================================================
+# Main training entrypoint (replaces Megatron's pretrain() for MIMO)
+# ============================================================================
+def run():
+    global _current_tp_group, _current_cp_group, _current_dp_group
+
+    # 1) Init megatron (sets up CUDA, args, dist, etc.) -----------------------
+    initialize_megatron(extra_args_provider=add_mimo_args, args_defaults={})
+    args = get_args()
+    assert args.micro_batch_size * args.llm_dp % args.encoder_dp == 0
+    # print_rank_0(f"[MIMO] args: {args}")
+
+    # 2) Build two grids side by side (encoder first, then LLM) ---------------
+    enc_world = args.encoder_tp * args.encoder_pp * args.encoder_dp * args.encoder_cp
+    llm_world = args.llm_tp * args.llm_pp * args.llm_dp * args.llm_cp
+    llm_ep_world = args.llm_ep * args.llm_etp * args.llm_edp
+    total = enc_world + llm_world
+    assert dist.get_world_size() == total, (f"World size {dist.get_world_size()} != encoder({enc_world}) + llm({llm_world})")
+    assert llm_ep_world == llm_world, (f"LLM EP world size {llm_ep_world} must equal LLM world size {llm_world}")
+
+    encoder_grid = create_hypercomm_grid_dense(offset=0, tp=args.encoder_tp, cp=args.encoder_cp, pp=args.encoder_pp, dp=args.encoder_dp)
+    llm_grid = create_hypercomm_grid_dense(offset=enc_world, tp=args.llm_tp, cp=args.llm_cp, pp=args.llm_pp, dp=args.llm_dp)
+    expert_grid = create_hypercomm_grid_moe(offset=enc_world, etp=args.llm_etp, ep=args.llm_ep, pp=args.llm_pp, edp=args.llm_edp)
+
+    # 3) Embedding PGs must be built by ALL ranks in the same order ----------
+    _create_all_embedding_groups([encoder_grid, llm_grid]) # don't need to create for expert_grid since experts don't have embeddings
+    # encoder process groups collection
+    encoder_pgc = ProcessGroupCollection()
+    encoder_pgc.tp = encoder_grid.get_pg("tp")
+    encoder_pgc.cp = encoder_grid.get_pg("cp")
+    encoder_pgc.pp = encoder_grid.get_pg("pp")
+    encoder_pgc.dp = encoder_grid.get_pg("dp")
+    encoder_pgc.dp_cp = encoder_grid.get_pg(["dp", "cp"])
+    encoder_pgc.ep = encoder_grid.get_pg("ep")
+    encoder_pgc.expt_dp = encoder_grid.get_pg("expt_dp")
+    # LLM process groups collection
+    language_pgc = ProcessGroupCollection()
+    language_pgc.tp = llm_grid.get_pg("tp")
+    language_pgc.cp = llm_grid.get_pg("cp")
+    language_pgc.pp = llm_grid.get_pg("pp")
+    language_pgc.dp = llm_grid.get_pg("dp")
+    language_pgc.dp_cp = llm_grid.get_pg(["dp", "cp"])
+    language_pgc.ep = expert_grid.get_pg("ep")
+    language_pgc.expt_tp = expert_grid.get_pg("expt_tp")
+    language_pgc.expt_dp = expert_grid.get_pg("expt_dp")
     
-    train_valid_test_datasets_provider.is_distributed = True # type: ignore
-    pretrain(
-        train_valid_test_datasets_provider,
-        model_provider,
-        ModelType.encoder_or_decoder,
-        forward_step,
-        args_defaults={},
-        extra_args_provider=add_mimo_args,
+    encoder_pgc = _add_embedding_groups(encoder_pgc, is_language_model=False)
+    language_pgc = _add_embedding_groups(language_pgc, is_language_model=True)
+    
+    _dump_pgc("encoder", encoder_pgc)
+    _dump_pgc("llm",     language_pgc)
+
+    attach_derived_groups(
+        pgc_grid_pairs=[
+            (encoder_pgc,  encoder_grid),
+            (language_pgc, llm_grid),
+            (language_pgc, expert_grid),
+        ],
+        combined_groups=[
+            ("tp_cp", ("tp", "cp")),
+            ("tp_dp_cp", ("tp", "dp", "cp")),
+            ("tp_ep", ("expt_tp", "ep")),
+            ("tp_ep_pp", ("expt_tp", "ep", "pp")),
+        ]
     )
+    if _is_rank_in_grid(llm_grid):
+        tp_ep_size = dist.get_world_size(language_pgc.tp_ep)
+        expected   = args.llm_etp * args.llm_ep
+        assert tp_ep_size == expected, (
+            f"language_pgc.tp_ep size={tp_ep_size}, expected {expected} "
+            f"(etp={args.llm_etp} * ep={args.llm_ep})"
+        )
+        print(f"[rank{dist.get_rank()}] OK: tp_ep size={tp_ep_size}, "
+            f"ranks={dist.get_process_group_ranks(language_pgc.tp_ep)}")
+
+    # Choose TP/CP/DP groups used by get_batch / loss_func for this rank
+    if _is_rank_in_grid(llm_grid):
+        _current_tp_group = language_pgc.tp
+        _current_cp_group = language_pgc.cp
+        _current_dp_group = language_pgc.dp
+    else:
+        _current_tp_group = encoder_pgc.tp
+        _current_cp_group = encoder_pgc.cp
+        _current_dp_group = encoder_pgc.dp
+
+    # 4) Build model ----------------------------------------------------------
+    seed = args.seed if hasattr(args, 'seed') else 1234
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    mimo_model = build_mimo_model(encoder_grid, llm_grid, encoder_pgc, language_pgc)
+
+    # 5) Schedule hooks on mimo_model.config ---------------------------------
+    @contextmanager
+    def no_sync_func():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for sm in mimo_model.modality_submodules.values():
+                if sm is not None:
+                    stack.enter_context(sm.no_sync())
+            yield
+    mimo_model.config.no_sync_func = no_sync_func
+
+    def finalize_grads_func(
+        model_chunks,
+        num_tokens=None,
+        pg_collection=None,        # consumed here, not passed down
+        force_all_reduce=False,
+    ):
+        # Note: intentionally ignore outer pg_collection; dispatch per-submodule PGC
+        if mimo_model.language_model is not None:
+            finalize_model_grads(
+                [mimo_model.language_model],
+                num_tokens=num_tokens,
+                pg_collection=language_pgc,
+                force_all_reduce=force_all_reduce,
+            )
+        for sm in mimo_model.modality_submodules.values():
+            if sm is not None:
+                finalize_model_grads(
+                    [sm],
+                    num_tokens=num_tokens,
+                    pg_collection=encoder_pgc,
+                    force_all_reduce=force_all_reduce,
+                )
+
+    mimo_model.config.calculate_per_token_loss = True
+    mimo_model.config.finalize_model_grads_func = finalize_grads_func
+    llm_mbs = args.micro_batch_size
+    num_microbatches = max(1, getattr(args, 'global_batch_size', llm_mbs) // (llm_mbs * args.llm_dp))
+
+    # 6) Optimizer (MIMO-aware) ----------------------------------------------
+    opt_config = OptimizerConfig(
+        optimizer=getattr(args, 'optimizer', 'adam'),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        clip_grad=args.clip_grad,
+        bf16=args.bf16,
+        fp16=args.fp16,
+        use_distributed_optimizer=True,
+    )
+    optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+    # 7) Multi-module communicator + pg collection ---------------------------
+    print(f"[MIMO] distributed info: pid={os.getpid()}, dist.is_initialized={dist.is_initialized()}, dist.get_rank={dist.get_rank() if dist.is_initialized() else 'N/A'}, dist.get_world_size={dist.get_world_size() if dist.is_initialized() else 'N/A'}.")
+    
+    module_to_grid_map = {
+        ENCODER_NAME: encoder_grid,
+        MIMO_LANGUAGE_MODULE_KEY: llm_grid,
+    }
+    topology = {ENCODER_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
+
+    communicator = MultiModulePipelineCommunicator(
+        module_to_grid_map, topology, mimo_model.config,
+        dim_mapping={'s': 0, 'h': 2, 'b': 1},
+        module_output_ndim={ENCODER_NAME: 2},
+    )
+
+    module_pgs = {}
+    lm_module_name = None
+    if _is_rank_in_grid(encoder_grid):
+        module_pgs[ENCODER_NAME] = encoder_pgc
+    if _is_rank_in_grid(llm_grid):
+        module_pgs[MIMO_LANGUAGE_MODULE_KEY] = language_pgc
+        lm_module_name = MIMO_LANGUAGE_MODULE_KEY
+    pg_collection_mm = MultiModuleProcessGroupCollection(
+        module_pgs=module_pgs, language_model_module_name=lm_module_name,
+    )
+    print_rank_0(f"[MIMO] init communicator done.")
+
+    # 8) Dataset & iterator ---------------------------------------------------
+    # NOTE: per-role MBS — encoder and LLM DP may differ.
+    encoder_mbs = args.micro_batch_size * args.llm_dp // args.encoder_dp
+
+    enc_needs = _is_rank_in_grid(encoder_grid) and is_pp_first_stage(encoder_grid.get_pg("pp"))
+    lm_needs = _is_rank_in_grid(llm_grid) and (is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp")))
+
+    if args.dataset_provider in ("llava_vlm", "video_llava_vlm"):
+        # Build independent dataloaders per module so encoder_dp and llm_dp
+        # can differ. Both use the same dataset, seed, and shuffle — contiguous
+        # sharding ensures data aligns: encoder DP j covers the same global
+        # samples as LLM DP [j*scale .. (j+1)*scale].
+        is_video = args.dataset_provider == "video_llava_vlm"
+        seed = args.seed if hasattr(args, 'seed') else 1234
+        torch.manual_seed(seed)
+
+        if enc_needs:
+            enc_dp_rank = dist.get_rank(encoder_pgc.dp)
+            enc_cp_size = dist.get_world_size(encoder_pgc.cp) if encoder_pgc.cp else 1
+            enc_tp_size = dist.get_world_size(encoder_pgc.tp) if encoder_pgc.tp else 1
+            print_rank_0(
+                f"[dataloader] encoder: dp_rank={enc_dp_rank}, dp_size={args.encoder_dp}, "
+                f"batch_size={encoder_mbs}, cp_size={enc_cp_size}, tp_size={enc_tp_size}"
+            )
+            data_iterator = build_vlm_dataloader(
+                dp_rank=enc_dp_rank,
+                dp_world_size=args.encoder_dp,
+                dp_group=encoder_pgc.dp,
+                max_seq_length=args.total_seq_length,
+                batch_size=encoder_mbs,
+                is_video_input=is_video,
+                cp_size=enc_cp_size,
+                tp_size=enc_tp_size,
+            )
+        elif lm_needs:
+            llm_dp_rank = dist.get_rank(language_pgc.dp)
+            llm_cp_size = dist.get_world_size(language_pgc.cp) if language_pgc.cp else 1
+            llm_tp_size = dist.get_world_size(language_pgc.tp) if language_pgc.tp else 1
+            print_rank_0(
+                f"[dataloader] LLM: dp_rank={llm_dp_rank}, dp_size={args.llm_dp}, "
+                f"batch_size={llm_mbs}, cp_size={llm_cp_size}, tp_size={llm_tp_size}"
+            )
+            data_iterator = build_vlm_dataloader(
+                dp_rank=llm_dp_rank,
+                dp_world_size=args.llm_dp,
+                dp_group=language_pgc.dp,
+                max_seq_length=args.total_seq_length,
+                batch_size=llm_mbs,
+                is_video_input=is_video,
+                cp_size=llm_cp_size,
+                tp_size=llm_tp_size,
+            )
+        else:
+            data_iterator = None
+    else:
+        # Legacy shared-iterator path for mock and other providers.
+        _DATASET_PROVIDERS = {
+            "mock": mock_train_valid_test_datasets_provider,
+            "llava_vlm": llava_vlm_dataloader_provider,
+            "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
+        }
+        
+        def train_valid_test_datasets_provider(*a, **kw):
+            ra = get_args()
+            try:
+                ds_provider = _DATASET_PROVIDERS[ra.dataset_provider]
+                if ra.dataset_provider != "mock":
+                    kw['max_seq_length'] = ra.total_seq_length
+            except KeyError as e:
+                raise ValueError(
+                    f"Unsupported dataset provider '{ra.dataset_provider}'."
+                ) from e
+            return ds_provider(*a, **kw)
+
+        train_ds, _, _ = train_valid_test_datasets_provider(
+            train_val_test_num_samples=[args.train_iters_mimo * llm_mbs, 0, 0]
+        )
+        data_iterator = iter(train_ds) if not hasattr(train_ds, '__next__') else train_ds
+        if not (enc_needs or lm_needs):
+            data_iterator = None
+
+    print_rank_0(f"[MIMO] init dataloader done.")
+
+    # 9) Training loop --------------------------------------------------------
+    seq_length = args.total_seq_length
+
+    for it in range(args.train_iters_mimo):
+        print_rank_0(f"==================== ITER {it} ====================")
+        optimizer.zero_grad()
+
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=[mimo_model],
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=llm_mbs,
+            forward_only=False,
+            p2p_communicator=communicator,
+            pg_collection=pg_collection_mm,
+        )
+
+        success, grad_norm, num_zeros = optimizer.step()
+        if not success:
+            print_rank_0(f"[iter {it}] optimizer step failed")
+            continue
+
+        if (it % args.log_interval_mimo == 0
+                and _is_rank_in_grid(llm_grid)
+                and is_pp_last_stage(llm_grid.get_pg("pp"))):
+            if losses:
+                report = losses[0].get('lm loss', None)
+                if report is not None and dist.get_rank(language_pgc.dp) == 0:
+                    val = report[0] / max(report[1].item(), 1)
+                    print(f"[iter {it}] loss={val.item():.4f} grad_norm={grad_norm:.3f}")
+
+    # 10) Clean up ------------------------------------------------------------
+    destroy_all_grids()
+    print_rank_0("[MIMO] training done")
+
+
+if __name__ == "__main__":
+    run()

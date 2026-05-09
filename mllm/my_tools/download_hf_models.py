@@ -46,7 +46,7 @@ def download_models(download_dir):
             low_cpu_mem_usage=True
         )
         
-        # 修复 transformers 库在保存时的 GenerationConfig 验证错误
+        # Fix GenerationConfig validation error in transformers when saving
         if hasattr(llm_model, "generation_config"):
             llm_model.generation_config.do_sample = True
             

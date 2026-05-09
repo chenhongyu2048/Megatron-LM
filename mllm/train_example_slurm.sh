@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu_a800            # Partition to submit to (adjust based on your cluster)
 #SBATCH --nodes=1                       # Number of nodes requested
 #SBATCH --ntasks-per-node=1             # Number of tasks per node (torchrun runs as a single task)
-#SBATCH --gres=gpu:2                    # Number of GPUs requested per node (matches nproc_per_node=2)
-#SBATCH --cpus-per-task=8               # Number of CPU cores requested per task (adjust based on your cluster)
+#SBATCH --gres=gpu:4                    # Number of GPUs requested per node (matches nproc_per_node=2)
+#SBATCH --cpus-per-task=16              # Number of CPU cores requested per task (adjust based on your cluster)
 #SBATCH --output=%x-%j.out              # Standard output log file path (%x is job name, %j is job ID)
 #SBATCH --error=%x-%j.err               # Standard error log file path
 #SBATCH --time=00:10:00                 # Time limit for the job (Format: HH:MM:SS)
