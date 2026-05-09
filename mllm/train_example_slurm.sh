@@ -22,5 +22,5 @@ export CPLUS_INCLUDE_PATH=$CUDNN_HOME/include:$CPLUS_INCLUDE_PATH
 export https_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 export http_proxy=http://u-MS9MdQ:Qixfk8ku@10.248.0.7:3128
 
-# bash ./run_vlm_train.sh /data/home/scyb683/run/dataset/energon_scienceqa
-bash ./run_vlm_train.sh /data/home/scyb683/run/dataset/energon_mmmu
+bash ./run_vlm_train.sh /data/home/scyb683/run/dataset/energon_scienceqa
+# bash ./run_vlm_train.sh /data/home/scyb683/run/dataset/energon_mmmu
